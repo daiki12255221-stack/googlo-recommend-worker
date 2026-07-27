@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<title>タイムパトロール モニター</title>
+<style>
+  body {
+    background: #121212;
+    color: #eee;
+    font-family: -apple-system, "Hiragino Sans", sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  .sub { color: #888; font-size: 12px; margin-bottom: 20px; }
+  .section { margin-bottom: 28px; }
+  .section h2 { font-size: 14px; color: #4CAF50; margin-bottom: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #2a2a2a; }
+  th { color: #999; font-weight: normal; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+  }
+  .badge-idle { background: #263238; color: #90a4ae; }
+  .badge-queued { background: #4a3b00; color: #ffca28; }
+  .badge-computing { background: #1b3a2b; color: #4CAF50; }
+  .empty { color: #666; font-size: 12px; padding: 10px 0; }
+  #updated { color: #555; font-size: 11px; }
+</style>
+</head>
+<body>
+  <h1>🚓 タイムパトロール モニター</h1>
+  <div class="sub">おすすめ計算キューの状態を確認するための内部用ページです。<span id="updated"></span></div>
+
+  <div class="section">
+    <h2>キューの並び順（先頭が次に処理される）</h2>
+    <div id="queue-area"></div>
+  </div>
+
+  <div class="section">
+    <h2>全ユーザーの状態</h2>
+    <div id="users-area"></div>
+  </div>
+
+<script>
+function badgeClass(status) {
+  if (status === "queued") return "badge badge-queued";
+  if (status === "computing") return "badge badge-computing";
+  return "badge badge-idle";
+}
+function badgeLabel(status) {
+  if (status === "queued") return "並び中";
+  if (status === "computing") return "計算中";
+  return "待機中";
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/queue");
+    const data = await res.json();
+
+    const queueArea = document.getElementById("queue-area");
+    if (!data.queue || data.queue.length === 0) {
+      queueArea.innerHTML = '<div class="empty">今は誰も並んでいません</div>';
+    } else {
+      queueArea.innerHTML = `
+        <table>
+          <tr><th>順番</th><th>ユーザー名</th></tr>
+          ${data.queue.map((u, i) => `<tr><td>${i + 1}</td><td>${u}</td></tr>`).join("")}
+        </table>
+      `;
+    }
+
+    const usersArea = document.getElementById("users-area");
+    if (!data.users || data.users.length === 0) {
+      usersArea.innerHTML = '<div class="empty">ユーザーがまだいません</div>';
+    } else {
+      usersArea.innerHTML = `
+        <table>
+          <tr><th>ユーザー名</th><th>状態</th></tr>
+          ${data.users
+            .map(
+              (u) =>
+                `<tr><td>${u.username}</td><td><span class="${badgeClass(u.status)}">${badgeLabel(u.status)}</span></td></tr>`
+            )
+            .join("")}
+        </table>
+      `;
+    }
+
+    document.getElementById("updated").textContent =
+      " 最終更新: " + new Date().toLocaleTimeString("ja-JP");
+  } catch (e) {
+    document.getElementById("queue-area").innerHTML =
+      '<div class="empty">取得に失敗しました</div>';
+  }
+}
+
+refresh();
+setInterval(refresh, 10000); // 10秒おきに自動更新
+</script>
+</body>
+</html>
