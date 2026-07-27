@@ -1,4 +1,4 @@
-const { kv } = require("./_redis");
+const { kv } = require("./redis");
 
 /**
  * queue.js - タイムパトロールの中身を見るためのAPI
