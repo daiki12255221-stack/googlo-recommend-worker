@@ -1,4 +1,4 @@
-const { kv } = require("./_redis");
+const { kv } = require("./redis");
 
 /**
  * watcher.js - server2「見張り係」
