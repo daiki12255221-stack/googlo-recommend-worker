@@ -83,7 +83,7 @@ async function refresh() {
           ${data.users
             .map(
               (u) =>
-                `<tr><td>${u.username}</td><td><span class="${badgeClass(u.status)}">${badgeLabel(u.status)}</span></td></tr>`
+                `<tr><td>${u.username}</td><td><span class="${badgeClass(u.status)}">${badgeLabel(u.status)}</span>${u.stage ? ` <span style="color:#888; font-size:11px;">(${u.stage})</span>` : ""}</td></tr>`
             )
             .join("")}
         </table>
