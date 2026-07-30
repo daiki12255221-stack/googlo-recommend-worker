@@ -4,11 +4,12 @@ const { kv } = require("./redis");
  * health-check.js - server3「健康診断係」
  * ------------------------------------------------------------
  * cron-job.orgから1時間おきに叩かれる想定。
- * Invidiousインスタンス27個全部に軽いリクエストを送って、
- * 生きていて・速いものを上位5つ「スタメン」として選び、
- * recommend:healthy_instances に保存する。
  *
- * server1(compute.js)はこのスタメンだけを使ってfetchするようになる。
+ * ただの生存確認(/api/v1/stats)だけだと「関連動画(relatedVideos)が
+ * ちゃんと機能してるか」までは分からないので、消える心配がほぼ無い
+ * 有名な固定動画(Never Gonna Give You Up)で実際に関連動画を取得できるか
+ * をテストする。取れたインスタンスの中から速い順に上位5つを
+ * 「スタメン」として recommend:healthy_instances に保存する。
  * ------------------------------------------------------------
  */
 
@@ -42,7 +43,9 @@ const INVIDIOUS_INSTANCES = [
   "https://youtube.mosesmang.com",
 ];
 
-const PING_TIMEOUT_MS = 4000;
+// テスト用の固定動画（Never Gonna Give You Up。消える心配がほぼ無い定番動画）
+const TEST_VIDEO_ID = "dQw4w9WgXcQ";
+const PING_TIMEOUT_MS = 5000;
 const TOP_N = 5;
 
 async function fetchWithTimeout(url, ms) {
@@ -60,20 +63,30 @@ module.exports = async function handler(req, res) {
     const results = await Promise.allSettled(
       INVIDIOUS_INSTANCES.map(async (base) => {
         const start = Date.now();
-        const url = `${base.replace(/\/$/, "")}/api/v1/stats`;
+        const url = `${base.replace(/\/$/, "")}/api/v1/videos/${TEST_VIDEO_ID}?region=JP`;
         const r = await fetchWithTimeout(url, PING_TIMEOUT_MS);
-        if (!r.ok) throw new Error("not ok");
-        await r.json(); // 中身がちゃんとJSONとして返ってくるかも確認する
-        return { base, latency: Date.now() - start };
+        const latency = Date.now() - start;
+
+        if (!r.ok) return { base, alive: false, hasRelated: false, latency };
+
+        const data = await r.json();
+        const hasRelated =
+          Array.isArray(data?.relatedVideos) && data.relatedVideos.length > 0;
+
+        return { base, alive: true, hasRelated, latency };
       })
     );
 
-    const alive = results
+    const all = results
       .filter((r) => r.status === "fulfilled")
-      .map((r) => r.value)
+      .map((r) => r.value);
+
+    const alive = all.filter((v) => v.alive);
+    const workingRelated = all
+      .filter((v) => v.hasRelated)
       .sort((a, b) => a.latency - b.latency);
 
-    const topInstances = alive.slice(0, TOP_N).map((v) => v.base);
+    const topInstances = workingRelated.slice(0, TOP_N).map((v) => v.base);
 
     if (topInstances.length > 0) {
       await kv.set("recommend:healthy_instances", JSON.stringify(topInstances));
@@ -81,7 +94,8 @@ module.exports = async function handler(req, res) {
 
     return res.status(200).json({
       checked: INVIDIOUS_INSTANCES.length,
-      alive: alive.length,
+      alive: alive.length, // 応答自体はあったインスタンス数
+      relatedVideosWorking: workingRelated.length, // その中で関連動画も返せたインスタンス数
       selected: topInstances,
     });
   } catch (error) {
