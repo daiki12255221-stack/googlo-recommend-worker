@@ -5,6 +5,9 @@
     },
     "api/health-check.js": {
       "maxDuration": 30
+    },
+    "api/test-invidious.js": {
+      "maxDuration": 60
     }
   }
 }
