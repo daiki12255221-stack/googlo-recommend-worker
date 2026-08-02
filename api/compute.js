@@ -28,7 +28,7 @@ const { kv } = require("./redis");
 
 // 中継サーバー(invidious-relay)のURL。Vercelの環境変数 INVIDIOUS_RELAY_URL で設定する
 // 例: https://xxxx-8080.csb.app
-const RELAY_BASE = process.env.INVIDIOUS_RELAY_URL || "https://t8rymp-8080.csb.app";
+const RELAY_BASE = process.env.INVIDIOUS_RELAY_URL || "";
 const RELAY_TIMEOUT_MS = 15000;
 const YT_TIMEOUT_MS = 8000;
 const MAX_ATTEMPTS = 3; // 初回 + お残しリトライ2回
@@ -110,10 +110,24 @@ async function fetchInvidious(path) {
     const res = await fetchWithTimeout(url, RELAY_TIMEOUT_MS, {
       headers: { Cookie: "csb_is_trusted=true" },
     });
-    if (!res.ok) return null;
+
+    if (!res.ok) {
+      // 中継サーバーが返してくれた失敗理由(errorSamples)をVercelのログに出す
+      let detail = null;
+      try {
+        detail = await res.json();
+      } catch (_) {}
+      console.error(
+        `[compute] invidious-relay 失敗 path=${path} status=${res.status}`,
+        JSON.stringify(detail?.errorSamples || detail || {})
+      );
+      return null;
+    }
+
     const json = await res.json();
     return json?.data || null;
-  } catch (_) {
+  } catch (e) {
+    console.error(`[compute] invidious-relay 通信エラー path=${path}:`, e.message);
     return null;
   }
 }
