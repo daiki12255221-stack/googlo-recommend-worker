@@ -5,47 +5,32 @@ const { kv } = require("./redis");
  * ------------------------------------------------------------
  * cron-job.orgから1時間おきに叩かれる想定。
  *
- * ただの生存確認(/api/v1/stats)だけだと「関連動画(relatedVideos)が
- * ちゃんと機能してるか」までは分からないので、消える心配がほぼ無い
- * 有名な固定動画(Never Gonna Give You Up)で実際に関連動画を取得できるか
- * をテストする。取れたインスタンスの中から速い順に上位5つを
- * 「スタメン」として recommend:healthy_instances に保存する。
+ * 固定の27個リストは古くなって死んでるインスタンスだらけだったので、
+ * Invidious公式が公開している「今生きてるインスタンス一覧」API
+ * (api.invidious.io/instances.json) を毎回取得し、その中から
+ * 実際に関連動画(relatedVideos)を返せるインスタンスをテストする。
+ *
+ * 消える心配がほぼ無い有名な固定動画(Never Gonna Give You Up)で
+ * テストし、速い順に上位5つを「スタメン」として
+ * recommend:healthy_instances に保存する。
+ *
+ * 公式リストの取得自体に失敗した場合は、保険として固定リストにフォールバックする。
  * ------------------------------------------------------------
  */
 
-const INVIDIOUS_INSTANCES = [
+// 保険用のフォールバックリスト（公式リスト取得に失敗した時だけ使う）
+const FALLBACK_INSTANCES = [
   "https://inv.nadeko.net",
-  "https://invidious.f5.si",
-  "https://invidious.lunivers.trade",
-  "https://invidious.ducks.party",
-  "https://iv.melmac.space",
-  "https://invidious.nerdvpn.de",
-  "https://invidious.privacyredirect.com",
-  "https://invidious.technicalvoid.dev",
-  "https://invidious.darkness.services",
-  "https://invidious.nikkosphere.com",
-  "https://invidious.schenkel.eti.br",
-  "https://invidious.tiekoetter.com",
-  "https://invidious.perennialte.ch",
-  "https://invidious.reallyaweso.me",
-  "https://invidious.private.coffee",
-  "https://invidious.privacydev.net",
   "https://yewtu.be",
-  "https://iv.nboeck.de",
-  "https://inv.tux.pizza",
+  "https://invidious.privacydev.net",
   "https://iv.ggtyler.dev",
-  "https://yt.omada.cafe",
-  "https://super8.absturztau.be",
-  "https://invidious.adminforge.de",
-  "https://youtube.alt.tyil.nl",
-  "https://rust.oskamp.nl",
-  "https://invidious.nietzospannend.nl",
-  "https://youtube.mosesmang.com",
+  "https://invidious.f5.si",
 ];
 
-// テスト用の固定動画（Never Gonna Give You Up。消える心配がほぼ無い定番動画）
-const TEST_VIDEO_ID = "dQw4w9WgXcQ";
+const INSTANCE_LIST_URL = "https://api.invidious.io/instances.json?sort_by=type,health";
+const TEST_VIDEO_ID = "dQw4w9WgXcQ"; // Never Gonna Give You Up（定番の消えない動画）
 const PING_TIMEOUT_MS = 5000;
+const LIST_TIMEOUT_MS = 8000;
 const TOP_N = 5;
 
 async function fetchWithTimeout(url, ms) {
@@ -58,10 +43,35 @@ async function fetchWithTimeout(url, ms) {
   }
 }
 
+// Invidious公式の「生きてるインスタンス一覧」を取得する
+async function fetchOfficialInstanceList() {
+  try {
+    const res = await fetchWithTimeout(INSTANCE_LIST_URL, LIST_TIMEOUT_MS);
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!Array.isArray(data)) return [];
+
+    // 形式: [ ["domain.com", { type: "https", uri: "https://domain.com", ... }], ... ]
+    return data
+      .filter(([, details]) => details?.type === "https")
+      .map(([domain, details]) => details?.uri || `https://${domain}`)
+      .filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+}
+
 module.exports = async function handler(req, res) {
   try {
+    let instances = await fetchOfficialInstanceList();
+    let usedFallback = false;
+    if (instances.length === 0) {
+      instances = FALLBACK_INSTANCES;
+      usedFallback = true;
+    }
+
     const results = await Promise.allSettled(
-      INVIDIOUS_INSTANCES.map(async (base) => {
+      instances.map(async (base) => {
         const start = Date.now();
         const url = `${base.replace(/\/$/, "")}/api/v1/videos/${TEST_VIDEO_ID}?region=JP`;
         const r = await fetchWithTimeout(url, PING_TIMEOUT_MS);
@@ -93,9 +103,10 @@ module.exports = async function handler(req, res) {
     }
 
     return res.status(200).json({
-      checked: INVIDIOUS_INSTANCES.length,
-      alive: alive.length, // 応答自体はあったインスタンス数
-      relatedVideosWorking: workingRelated.length, // その中で関連動画も返せたインスタンス数
+      usedFallback,
+      checked: instances.length,
+      alive: alive.length,
+      relatedVideosWorking: workingRelated.length,
       selected: topInstances,
     });
   } catch (error) {
