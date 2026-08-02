@@ -74,6 +74,15 @@ module.exports = async function handler(req, res) {
         : { historyIds: [], searchTerms: [] };
 
       if (hasNewItems(currentSnapshot, previousSnapshot)) {
+        // 何が原因で並び直したのかをログに残す（既存分にだけ絞って表示）
+        const prevIdSet = new Set(previousSnapshot.historyIds || []);
+        const prevTermSet = new Set(previousSnapshot.searchTerms || []);
+        const newVideoIds = currentSnapshot.historyIds.filter((id) => !prevIdSet.has(id));
+        const newTerms = currentSnapshot.searchTerms.filter((t) => !prevTermSet.has(t));
+        console.log(
+          `[watcher] ${username} を再度キューへ追加: 新規動画=${JSON.stringify(newVideoIds)} 新規検索=${JSON.stringify(newTerms)}`
+        );
+
         await kv.rpush("recommend:queue", username);
         await kv.set(statusKey, "queued");
         // 「もうこの分は見た」と記録しておく（同じ差分を毎回検知しないように）
