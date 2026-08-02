@@ -15,52 +15,23 @@ const { kv } = require("./redis");
  * 各候補には _route(どの分類から来たか) と _sourceRef(その分類の中で
  * 具体的にどの検索ワード／どの動画がきっかけだったか) を必ず記録する。
  *
+ * 【重要】VercelからInvidiousへ直接アクセスすると403でブロックされることが
+ * 判明したため、Invidiousへのアクセスは全て「invidious-relay」
+ * (別ネットワークのCodeSandboxで動く中継サーバー)経由で行う。
+ * 中継先はプレビュー確認画面が出るため、Cookie: csb_is_trusted=true を付けて回避する。
+ *
  * 「お残し」リトライ方式:
  *   各分類でネットワーク的に失敗した項目(=何も取れなかった項目)だけを
  *   メモっておき、最大2回まで再挑戦する。3回目もダメなら諦めて次の分類へ。
- *
- * インスタンス選定はserver3(health-check.js)が1時間おきに選んだ
- * 「スタメン」(recommend:healthy_instances)を優先して使う。
- * まだスタメンが無ければ全27インスタンスからその都度シャッフルして使う。
  * ------------------------------------------------------------
  */
 
-const INVIDIOUS_INSTANCES = [
-  "https://inv.nadeko.net",
-  "https://invidious.f5.si",
-  "https://invidious.lunivers.trade",
-  "https://invidious.ducks.party",
-  "https://iv.melmac.space",
-  "https://invidious.nerdvpn.de",
-  "https://invidious.privacyredirect.com",
-  "https://invidious.technicalvoid.dev",
-  "https://invidious.darkness.services",
-  "https://invidious.nikkosphere.com",
-  "https://invidious.schenkel.eti.br",
-  "https://invidious.tiekoetter.com",
-  "https://invidious.perennialte.ch",
-  "https://invidious.reallyaweso.me",
-  "https://invidious.private.coffee",
-  "https://invidious.privacydev.net",
-  "https://yewtu.be",
-  "https://iv.nboeck.de",
-  "https://inv.tux.pizza",
-  "https://iv.ggtyler.dev",
-  "https://yt.omada.cafe",
-  "https://super8.absturztau.be",
-  "https://invidious.adminforge.de",
-  "https://youtube.alt.tyil.nl",
-  "https://rust.oskamp.nl",
-  "https://invidious.nietzospannend.nl",
-  "https://youtube.mosesmang.com",
-];
-const TRY_INSTANCES_LIMIT = 5;
-const INSTANCE_TIMEOUT_MS = 3000;
+// 中継サーバー(invidious-relay)のURL。Vercelの環境変数 INVIDIOUS_RELAY_URL で設定する
+// 例: https://xxxx-8080.csb.app
+const RELAY_BASE = process.env.INVIDIOUS_RELAY_URL || "https://t8rymp-8080.csb.app";
+const RELAY_TIMEOUT_MS = 15000;
 const YT_TIMEOUT_MS = 8000;
 const MAX_ATTEMPTS = 3; // 初回 + お残しリトライ2回
-
-// スタメン(健康診断済みインスタンス)。handler()の先頭でRedisから読み込んで上書きする
-let activeInstances = INVIDIOUS_INSTANCES;
 
 const FALLBACK_KEYS = [
   "AIzaSyBfCvyZ_J9mJiMFNYB6WfcuLyvf9zDdcUU",
@@ -128,19 +99,23 @@ async function fetchWithTimeout(url, ms, options = {}) {
   }
 }
 
-// ─── Invidiousフェッチ（スタメンを優先して試す） ────────────────────────────
+// ─── Invidiousへのアクセスは全部この中継窓口経由 ────────────────────────────
 async function fetchInvidious(path) {
-  const instances = shuffle(activeInstances).slice(0, TRY_INSTANCES_LIMIT);
-  for (const base of instances) {
-    try {
-      const url = `${base.replace(/\/$/, "")}${path}`;
-      const res = await fetchWithTimeout(url, INSTANCE_TIMEOUT_MS);
-      if (!res.ok) continue;
-      const data = await res.json();
-      if (data && !data.error) return data;
-    } catch (_) {}
+  if (!RELAY_BASE) {
+    console.error("[compute] INVIDIOUS_RELAY_URL が設定されていません");
+    return null;
   }
-  return null;
+  try {
+    const url = `${RELAY_BASE.replace(/\/$/, "")}/api/invidious-relay?path=${encodeURIComponent(path)}`;
+    const res = await fetchWithTimeout(url, RELAY_TIMEOUT_MS, {
+      headers: { Cookie: "csb_is_trusted=true" },
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.data || null;
+  } catch (_) {
+    return null;
+  }
 }
 
 async function fetchYouTube(endpoint, params, apiKey, retried = false) {
@@ -158,10 +133,11 @@ async function fetchYouTube(endpoint, params, apiKey, retried = false) {
   }
 }
 
+// kanrenn.jsと同じく、relatedVideos と recommendedVideos の両方を見る
 async function fetchRelated(vId, limit = 2) {
   const data = await fetchInvidious(`/api/v1/videos/${vId}?region=JP`);
-  if (!data?.relatedVideos) return [];
-  return data.relatedVideos.slice(0, limit);
+  const related = data?.relatedVideos || data?.recommendedVideos || [];
+  return related.slice(0, limit);
 }
 
 async function scoreVideos(ids, apiKey) {
@@ -196,9 +172,6 @@ async function scoreVideos(ids, apiKey) {
   return result;
 }
 
-// ─── 「お残し」リトライ方式の共通処理 ───────────────────────────────────────
-// workerFn(item) は「データが取れたか(true/false)」を返す約束にする。
-// falseだったものだけを、最大MAX_ATTEMPTS回まで繰り返し再挑戦する。
 async function processWithRetry(items, workerFn, maxAttempts = MAX_ATTEMPTS) {
   let pending = [...items];
   for (let attempt = 1; attempt <= maxAttempts && pending.length > 0; attempt++) {
@@ -210,7 +183,7 @@ async function processWithRetry(items, workerFn, maxAttempts = MAX_ATTEMPTS) {
     });
     pending = leftover;
   }
-  return pending; // 最後まで取れなかった項目（諦めたもの）
+  return pending;
 }
 
 function buildInitialProgress(data) {
@@ -238,27 +211,21 @@ function buildInitialProgress(data) {
     longWatch: shuffle(watchArr.slice(100, 500)).slice(0, 10),
     chCount: {},
     tagCount: {},
-    candidates: [], // { id, snippet, _route, _sourceRef }
+    candidates: [],
     seenIds: Array.from(seenIds),
     trendingPool: [],
-    gaveUp: {}, // 分類ごとに、リトライしても取れなかった項目の記録
+    gaveUp: {},
   };
 }
 
 module.exports = async function handler(req, res) {
   try {
-    // ⓪ スタメン(健康なインスタンス)を読み込む。無ければ全27個をそのまま使う
-    const rawHealthy = await kv.get("recommend:healthy_instances");
-    if (rawHealthy) {
-      const parsed =
-        typeof rawHealthy === "string" ? JSON.parse(rawHealthy) : rawHealthy;
-      activeInstances =
-        Array.isArray(parsed) && parsed.length > 0 ? parsed : INVIDIOUS_INSTANCES;
-    } else {
-      activeInstances = INVIDIOUS_INSTANCES;
+    if (!RELAY_BASE) {
+      return res.status(500).json({
+        error: "INVIDIOUS_RELAY_URL が設定されていません。Vercelの環境変数に追加してください。",
+      });
     }
 
-    // ① 今計算中のユーザーがいなければ、キューから1人取り出す
     let username = await kv.get("recommend:current_user");
     if (!username) {
       username = await kv.lpop("recommend:queue");
@@ -277,7 +244,6 @@ module.exports = async function handler(req, res) {
         : rawProgress
       : null;
 
-    // ② 初回ならデータを取得して進捗を組み立てる
     if (!progress) {
       const rawData = await kv.get(`user:${username}:data`);
       const data = rawData
@@ -296,10 +262,8 @@ module.exports = async function handler(req, res) {
       return true;
     };
 
-    // ③ 現在の分類(stage)だけを処理する
     switch (progress.stage) {
       case "search": {
-        // 検索ワードは1回叩けば結果が来るか来ないかはっきりするので、そのまま処理
         await Promise.allSettled(
           progress.searchKeywords.map(async (word) => {
             if (!word) return;
@@ -330,7 +294,7 @@ module.exports = async function handler(req, res) {
       case "watch_recent": {
         const gaveUp = await processWithRetry(progress.recentWatch, async (item) => {
           const id = item?.id || (typeof item === "string" ? item : "");
-          if (!id) return true; // 空データはリトライ対象にしない
+          if (!id) return true;
           const chId = item?.channelId || item?.snippet?.channelId || "";
           if (chId) progress.chCount[chId] = (progress.chCount[chId] || 0) + 1;
 
@@ -345,7 +309,7 @@ module.exports = async function handler(req, res) {
               _sourceRef: id,
             });
           }
-          return related.length > 0; // 何も取れなかった時だけ「失敗」扱いにする
+          return related.length > 0;
         });
         progress.gaveUp.watch_recent = gaveUp.map((it) => it?.id || it);
         progress.stage = "watch_mid";
@@ -420,7 +384,6 @@ module.exports = async function handler(req, res) {
           (a, b) => b[1] - a[1]
         )[0]?.[0];
         if (topChId) {
-          // 単発フェッチなので、失敗したら最大3回までその場で挑戦し直す
           let data = null;
           for (let i = 0; i < MAX_ATTEMPTS && !data; i++) {
             data = await fetchInvidious(`/api/v1/channels/${topChId}/videos?region=JP`);
@@ -531,7 +494,6 @@ module.exports = async function handler(req, res) {
           _sourceRef: v._sourceRef,
         }));
 
-        // 表示データへ一気に移す（計算中の歯抜け状態は絶対に見せない）
         await kv.set(`recommend:${username}:display`, JSON.stringify(finalList));
         await kv.del(progressKey);
         await kv.del("recommend:current_user");
@@ -550,7 +512,6 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // ④ この分類の処理結果を保存して、次回の呼び出しに続きを託す
     progress.seenIds = Array.from(seenIds);
     await kv.set(progressKey, JSON.stringify(progress));
 
