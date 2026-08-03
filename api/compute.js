@@ -1,5 +1,34 @@
 const { kv } = require("./redis");
-const RELAY_BASE = process.env.INVIDIOUS_RELAY_URL || "";
+
+/**
+ * compute.js - server1「計算係」
+ * ------------------------------------------------------------
+ * cron-job.orgから定期的に叩かれる想定。
+ * タイムパトロール(recommend:queue)から1人取り出し、recommend.jsのロジックを
+ * 「分類(カテゴリ)ごとに1回の呼び出しで1つずつ」処理していく。
+ *
+ * 分類の順番:
+ *   search(検索履歴) → watch_recent(直近視聴) → watch_mid(中期視聴)
+ *   → long_tag(長期視聴タグ) → fav_channel(お気に入りチャンネル)
+ *   → trending(急上昇) → substitute(身代わり補充) → scoring(最終スコアリング)
+ *
+ * 各候補には _route(どの分類から来たか) と _sourceRef(その分類の中で
+ * 具体的にどの検索ワード／どの動画がきっかけだったか) を必ず記録する。
+ *
+ * 【重要】VercelからInvidiousへ直接アクセスすると403でブロックされることが
+ * 判明したため、Invidiousへのアクセスは全て「invidious-relay」
+ * (別ネットワークのCodeSandboxで動く中継サーバー)経由で行う。
+ * 中継先はプレビュー確認画面が出るため、Cookie: csb_is_trusted=true を付けて回避する。
+ *
+ * 「お残し」リトライ方式:
+ *   各分類でネットワーク的に失敗した項目(=何も取れなかった項目)だけを
+ *   メモっておき、最大2回まで再挑戦する。3回目もダメなら諦めて次の分類へ。
+ * ------------------------------------------------------------
+ */
+// 中継サーバー(invidious-relay)のURL。
+// コードサンドボックスのアカウントを使い回す前提なので、環境変数ではなく
+// ここに直接URLを書き換える運用にする。中継先を変えたらここを書き換えてpushするだけ。
+const RELAY_BASE = "https://t8rymp-8080.csb.app";
 const RELAY_TIMEOUT_MS = 15000;
 const YT_TIMEOUT_MS = 8000;
 const MAX_ATTEMPTS = 3; // 初回 + お残しリトライ2回
