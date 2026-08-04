@@ -1,33 +1,4 @@
 const { kv } = require("./redis");
-
-/**
- * compute.js - server1「計算係」
- * ------------------------------------------------------------
- * cron-job.orgから定期的に叩かれる想定。
- * タイムパトロール(recommend:queue)から1人取り出し、recommend.jsのロジックを
- * 「分類(カテゴリ)ごとに1回の呼び出しで1つずつ」処理していく。
- *
- * 分類の順番:
- *   search(検索履歴) → watch_recent(直近視聴) → watch_mid(中期視聴)
- *   → long_tag(長期視聴タグ) → fav_channel(お気に入りチャンネル)
- *   → trending(急上昇) → substitute(身代わり補充) → scoring(最終スコアリング)
- *
- * 各候補には _route(どの分類から来たか) と _sourceRef(その分類の中で
- * 具体的にどの検索ワード／どの動画がきっかけだったか) を必ず記録する。
- *
- * 【重要】VercelからInvidiousへ直接アクセスすると403でブロックされることが
- * 判明したため、Invidiousへのアクセスは全て「invidious-relay」
- * (別ネットワークのCodeSandboxで動く中継サーバー)経由で行う。
- * 中継先はプレビュー確認画面が出るため、Cookie: csb_is_trusted=true を付けて回避する。
- *
- * 「お残し」リトライ方式:
- *   各分類でネットワーク的に失敗した項目(=何も取れなかった項目)だけを
- *   メモっておき、最大2回まで再挑戦する。3回目もダメなら諦めて次の分類へ。
- * ------------------------------------------------------------
- */
-// 中継サーバー(invidious-relay)のURL。
-// コードサンドボックスのアカウントを使い回す前提なので、環境変数ではなく
-// ここに直接URLを書き換える運用にする。中継先を変えたらここを書き換えてpushするだけ。
 const RELAY_BASE = "https://t8rymp-8080.csb.app";
 const RELAY_TIMEOUT_MS = 15000;
 const YT_TIMEOUT_MS = 8000;
@@ -52,10 +23,6 @@ function getNextFallbackKey() {
   return key;
 }
 
-function makeThumbUrl(id) {
-  return `/api/thumb?id=${id}`;
-}
-
 function getVideoId(item) {
   if (!item) return "";
   return (
@@ -76,19 +43,6 @@ function shuffle(arr) {
   return a;
 }
 
-function makeSnippet(rv) {
-  return {
-    title: rv.title || "",
-    channelTitle: rv.author || rv.channelTitle || "",
-    channelId: rv.authorId || rv.channelId || "",
-    thumbnails: {
-      high: { url: makeThumbUrl(rv.videoId || rv.id || "") },
-      default: { url: makeThumbUrl(rv.videoId || rv.id || "") },
-    },
-    publishedAt: rv.publishedText || rv.published || "",
-  };
-}
-
 async function fetchWithTimeout(url, ms, options = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
@@ -99,7 +53,7 @@ async function fetchWithTimeout(url, ms, options = {}) {
   }
 }
 
-// ─── Invidiousへのアクセスは全部この中継窓口経由 ────────────────────────────
+// ─── Invidiousへのアクセス ────────────────────────────
 async function fetchInvidious(path) {
   if (!RELAY_BASE) {
     console.error("[compute] INVIDIOUS_RELAY_URL が設定されていません");
@@ -112,7 +66,6 @@ async function fetchInvidious(path) {
     });
 
     if (!res.ok) {
-      // 中継サーバーが返してくれた失敗理由(errorSamples)をVercelのログに出す
       let detail = null;
       try {
         detail = await res.json();
@@ -147,24 +100,28 @@ async function fetchYouTube(endpoint, params, apiKey, retried = false) {
   }
 }
 
-// kanrenn.jsと同じく、relatedVideos と recommendedVideos の両方を見る
-async function fetchRelated(vId, limit = 2) {
+// Invidiousからは関連動画の「ID」のみを抽出して返す
+async function fetchRelatedIds(vId, limit = 2) {
   const data = await fetchInvidious(`/api/v1/videos/${vId}?region=JP`);
   const related = data?.relatedVideos || data?.recommendedVideos || [];
-  return related.slice(0, limit);
+  return related
+    .map((rv) => rv.videoId || (typeof rv.id === "string" ? rv.id : ""))
+    .filter(Boolean)
+    .slice(0, limit);
 }
 
-async function scoreVideos(ids, apiKey) {
+// YouTube APIからSnippet（動画情報）とStatistics（スコア計算用）を一括取得する
+async function fetchVideoDetailsAndScore(ids, apiKey) {
   const result = {};
   const batches = [];
-  for (let i = 0; i < ids.length; i += 10) batches.push(ids.slice(i, i + 10));
+  for (let i = 0; i < ids.length; i += 50) batches.push(ids.slice(i, i + 50)); // videos APIは最大50件まで一括可能
 
   await Promise.allSettled(
     batches.map(async (batch) => {
       try {
         const data = await fetchYouTube(
           "videos",
-          { id: batch.join(","), part: "statistics" },
+          { id: batch.join(","), part: "snippet,statistics" },
           apiKey
         );
         if (!data?.items) return;
@@ -178,7 +135,11 @@ async function scoreVideos(ids, apiKey) {
               : views > 0
               ? Math.min((likes / views) * 1000, 100)
               : 0;
-          result[item.id] = score;
+
+          result[item.id] = {
+            snippet: item.snippet,
+            score,
+          };
         }
       } catch (_) {}
     })
@@ -294,7 +255,6 @@ module.exports = async function handler(req, res) {
               if (!addIfNew(id)) continue;
               progress.candidates.push({
                 id,
-                snippet: item.snippet,
                 _route: "search",
                 _sourceRef: word,
               });
@@ -312,18 +272,17 @@ module.exports = async function handler(req, res) {
           const chId = item?.channelId || item?.snippet?.channelId || "";
           if (chId) progress.chCount[chId] = (progress.chCount[chId] || 0) + 1;
 
-          const related = await fetchRelated(id, 2);
-          for (const rv of related) {
-            const rvId = rv.videoId || rv.id || "";
+          // InvidiousからはIDのみ取得
+          const relatedIds = await fetchRelatedIds(id, 2);
+          for (const rvId of relatedIds) {
             if (!addIfNew(rvId)) continue;
             progress.candidates.push({
               id: rvId,
-              snippet: makeSnippet(rv),
               _route: "watch_recent",
               _sourceRef: id,
             });
           }
-          return related.length > 0;
+          return relatedIds.length > 0;
         });
         progress.gaveUp.watch_recent = gaveUp.map((it) => it?.id || it);
         progress.stage = "watch_mid";
@@ -334,18 +293,18 @@ module.exports = async function handler(req, res) {
         const gaveUp = await processWithRetry(progress.midWatch, async (item) => {
           const id = item?.id || (typeof item === "string" ? item : "");
           if (!id) return true;
-          const related = await fetchRelated(id, 1);
-          for (const rv of related) {
-            const rvId = rv.videoId || rv.id || "";
+
+          // InvidiousからはIDのみ取得
+          const relatedIds = await fetchRelatedIds(id, 1);
+          for (const rvId of relatedIds) {
             if (!addIfNew(rvId)) continue;
             progress.candidates.push({
               id: rvId,
-              snippet: makeSnippet(rv),
               _route: "watch_mid",
               _sourceRef: id,
             });
           }
-          return related.length > 0;
+          return relatedIds.length > 0;
         });
         progress.gaveUp.watch_mid = gaveUp.map((it) => it?.id || it);
         progress.stage = "long_tag";
@@ -382,7 +341,6 @@ module.exports = async function handler(req, res) {
               if (!addIfNew(id)) continue;
               progress.candidates.push({
                 id,
-                snippet: item.snippet,
                 _route: "long_tag",
                 _sourceRef: topTag,
               });
@@ -407,18 +365,9 @@ module.exports = async function handler(req, res) {
           for (const v of picked) {
             const id = v.videoId || v.id || "";
             if (!addIfNew(id)) continue;
+            // InvidiousからはIDのみ取得して追加
             progress.candidates.push({
               id,
-              snippet: {
-                title: v.title || "",
-                channelTitle: v.author || v.channelTitle || "",
-                channelId: topChId,
-                thumbnails: {
-                  high: { url: makeThumbUrl(id) },
-                  default: { url: makeThumbUrl(id) },
-                },
-                publishedAt: v.publishedText || v.published || "",
-              },
               _route: "fav_channel",
               _sourceRef: topChId,
             });
@@ -462,19 +411,19 @@ module.exports = async function handler(req, res) {
           const triggers = shuffle(progress.candidates).slice(0, shortage);
           const gaveUp = await processWithRetry(triggers, async (v) => {
             if (progress.candidates.length >= 90) return true;
-            const related = await fetchRelated(v.id, 1);
-            for (const rv of related) {
-              const rvId = rv.videoId || rv.id || "";
+
+            // InvidiousからはIDのみ取得
+            const relatedIds = await fetchRelatedIds(v.id, 1);
+            for (const rvId of relatedIds) {
               if (!addIfNew(rvId)) continue;
               progress.candidates.push({
                 id: rvId,
-                snippet: makeSnippet(rv),
                 _route: "substitute",
                 _sourceRef: v.id,
               });
               break;
             }
-            return related.length > 0;
+            return relatedIds.length > 0;
           });
           progress.gaveUp.substitute = gaveUp.map((it) => it?.id || it);
         }
@@ -484,10 +433,21 @@ module.exports = async function handler(req, res) {
 
       case "scoring": {
         const scoringTargets = progress.candidates.slice(0, 90);
-        const scoreMap = await scoreVideos(scoringTargets.map((v) => v.id));
+        const ids = scoringTargets.map((v) => v.id);
+
+        // YouTube Data API から snippet と score(statistics) を一括取得
+        const detailsMap = await fetchVideoDetailsAndScore(ids);
 
         const scoredVideos = scoringTargets
-          .map((v) => ({ ...v, _score: scoreMap[v.id] ?? 0 }))
+          .map((v) => {
+            const details = detailsMap[v.id];
+            return {
+              ...v,
+              snippet: details?.snippet || {},
+              _score: details?.score ?? 0,
+            };
+          })
+          .filter((v) => v.snippet.title) // YouTube API側で消えていた動画（非公開等）を除外
           .sort((a, b) => b._score - a._score);
 
         const result = [...scoredVideos];
