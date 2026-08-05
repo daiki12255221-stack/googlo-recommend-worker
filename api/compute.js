@@ -187,10 +187,34 @@ async function scoreVideos(ids, apiKey) {
   return result;
 }
 
+const RELAY_CONCURRENCY = 5; // 中継サーバーに同時に投げる件数の上限（過負荷防止）
+
+// Promise.allSettledと同じ形の結果を返すが、同時実行数をlimitまでに抑える版
+async function mapWithConcurrency(items, limit, workerFn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < items.length) {
+      const current = cursor++;
+      try {
+        const value = await workerFn(items[current]);
+        results[current] = { status: "fulfilled", value };
+      } catch (reason) {
+        results[current] = { status: "rejected", reason };
+      }
+    }
+  }
+
+  const workerCount = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
 async function processWithRetry(items, workerFn, maxAttempts = MAX_ATTEMPTS) {
   let pending = [...items];
   for (let attempt = 1; attempt <= maxAttempts && pending.length > 0; attempt++) {
-    const outcomes = await Promise.allSettled(pending.map((item) => workerFn(item)));
+    const outcomes = await mapWithConcurrency(pending, RELAY_CONCURRENCY, workerFn);
     const leftover = [];
     outcomes.forEach((o, i) => {
       const success = o.status === "fulfilled" && o.value === true;
