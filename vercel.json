@@ -1,7 +1,7 @@
 {
   "functions": {
     "api/compute.js": {
-      "maxDuration": 60
+      "maxDuration": 120
     },
     "api/health-check.js": {
       "maxDuration": 30
