@@ -30,7 +30,7 @@ const { kv } = require("./redis");
 // コードサンドボックスのアカウントを使い回す前提なので、環境変数ではなく
 // ここに直接URLを書き換える運用にする。中継先を変えたらここを書き換えてpushするだけ。
 const RELAY_BASE = "https://t8rymp-8080.csb.app";
-const RELAY_TIMEOUT_MS = 15000;
+const RELAY_TIMEOUT_MS = 8000;
 const YT_TIMEOUT_MS = 8000;
 const MAX_ATTEMPTS = 3; // 初回 + お残しリトライ2回
 
@@ -187,7 +187,7 @@ async function scoreVideos(ids, apiKey) {
   return result;
 }
 
-const RELAY_CONCURRENCY = 5; // 中継サーバーに同時に投げる件数の上限（過負荷防止）
+const RELAY_CONCURRENCY = 15; // 中継サーバーへの負荷と、Vercelの実行時間制限のバランスを取った値
 
 // Promise.allSettledと同じ形の結果を返すが、同時実行数をlimitまでに抑える版
 async function mapWithConcurrency(items, limit, workerFn) {
